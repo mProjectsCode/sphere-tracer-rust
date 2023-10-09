@@ -1,7 +1,7 @@
 use crate::distance_fields::{DistanceField, DistanceFunction};
 use crate::ray::Ray;
-use crate::vector::Vec3;
-use crate::vector::Vec4;
+use crate::vec3::Vec3;
+use crate::vec4::Vec4;
 
 pub struct RayMarcher {
     // quality
@@ -30,28 +30,46 @@ pub struct RayMarcher {
     // indirect light
     pub bg_light_color: Vec3,
     pub bg_light_intensity: f64,
+
+    // shadow
+    pub shadow_dist_min: f64,
+    pub shadow_dist_max: f64,
+    pub shadow_fuzziness: f64,
+
+    // AO
+    pub ao_step_size: f64,
+    pub ao_intensity: f64,
+    pub ao_iterations: i32,
 }
 
 pub fn create_ray_marcher(scene: DistanceField) -> RayMarcher {
-    let max_iterations = 200;
-    let max_distance = 64.;
-    let accuracy = 0.001;
+    let max_iterations = 4000;
+    let max_distance = 7.;
+    let accuracy = 0.00001;
 
     let debug = false;
 
-    let obj_color = Vec3::new(1., 0., 1.);
+    let obj_color = Vec3::new(1., 1., 1.);
 
-    let normal_accuracy = 0.00001;
+    let normal_accuracy = 0.000001;
     let offset_x = Vec3::new(normal_accuracy, 0., 0.);
     let offset_y = Vec3::new(0., normal_accuracy, 0.);
     let offset_z = Vec3::new(0., 0., normal_accuracy);
 
-    let light_dir = Vec3::new(1., -0.1, -0.2).normalize();
-    let light_color = Vec3::new(0.7, 0.7, 1.);
+    let light_dir = Vec3::new(0.5, -1., 0.5).normalize();
+    let light_color = Vec3::new(1., 1., 1.);
     let light_intensity = 1.;
 
     let bg_light_color = Vec3::new(1., 1., 1.);
-    let bg_light_intensity = 0.2;
+    let bg_light_intensity = 0.1;
+
+    let shadow_dist_min = 0.0;
+    let shadow_dist_max = max_distance;
+    let shadow_fuzziness = 5.;
+
+    let ao_step_size = 0.05;
+    let ao_intensity = 0.3;
+    let ao_iterations = 3;
 
 
     RayMarcher {
@@ -77,6 +95,13 @@ pub fn create_ray_marcher(scene: DistanceField) -> RayMarcher {
         bg_light_color,
         bg_light_intensity,
 
+        shadow_dist_min,
+        shadow_dist_max,
+        shadow_fuzziness,
+
+        ao_step_size,
+        ao_intensity,
+        ao_iterations,
     }
 }
 
@@ -122,35 +147,35 @@ impl RayMarcher {
 
     fn get_normal(&self, p: &Vec3) -> Vec3 {
         Vec3::new(
-            self.distance_field(&(p + &self.offset_x)) - self.distance_field(&(p - &self.offset_x)),
-            self.distance_field(&(p + &self.offset_y)) - self.distance_field(&(p - &self.offset_y)),
-            self.distance_field(&(p + &self.offset_z)) - self.distance_field(&(p - &self.offset_z)),
+            self.distance_field(&(p + self.offset_x)) - self.distance_field(&(p - self.offset_x)),
+            self.distance_field(&(p + self.offset_y)) - self.distance_field(&(p - self.offset_y)),
+            self.distance_field(&(p + self.offset_z)) - self.distance_field(&(p - self.offset_z)),
         ).normalize()
     }
 
     fn shading(&self, p: &Vec3) -> Vec4 {
         let n = self.get_normal(&p);
         let shadow = self.shadow(&p, &n);
+        let ambient_occlusion = self.ambient_occlusion(&p, &n);
 
         // Vec4::from_vec3(&n, 1.)
 
-        let sun_light = self.obj_color * (self.light_color * Vec3::dot(&(-&self.light_dir), &n).clamp(0., 1.) * self.light_intensity * shadow);
-        let bg_light = self.obj_color * (self.bg_light_color * self.bg_light_intensity);
+        let sun_light = self.obj_color * (self.light_color * Vec3::dot(&(-self.light_dir), &n).clamp(0., 1.) * self.light_intensity * shadow);
+        let bg_light = self.obj_color * (self.bg_light_color * self.bg_light_intensity) * ambient_occlusion;
 
-        Vec4::from_vec3(&(sun_light + bg_light), 1.)
+        let light = sun_light + bg_light;
+
+        Vec4::from_vec3(&light, 1.)
     }
 
     fn shadow(&self, p: &Vec3, n: &Vec3) -> f64 {
-        let sro = p + &(n * self.accuracy);
-        let sr = Ray::new(sro, -self.light_dir);
+        let sro = p + n * self.accuracy;
+        let sr = Ray::new(&sro, &(-self.light_dir));
 
-        let mut t: f64 = 0.;
+        let mut t: f64 = self.shadow_dist_min;
+        let mut result: f64 = 1.0;
 
-        for i in 0..self.max_iterations {
-            if t > self.max_distance {
-                return 1.;
-            }
-
+        while t < self.shadow_dist_max {
             let p = sr.orig + sr.dir * t;
             let d = self.distance_field(&p);
 
@@ -158,10 +183,25 @@ impl RayMarcher {
                 return 0.;
             }
 
+            result = result.min(self.shadow_fuzziness * d / t);
             t += d;
         }
 
-        return 1.;
+        return result.clamp(0., 1.);
+    }
+
+    fn ambient_occlusion(&self, p: &Vec3, n: &Vec3) -> f64 {
+        let mut ao: f64 = 0.0;
+        let mut dist: f64;
+
+        for i in 0..self.ao_iterations {
+            dist = self.ao_step_size * (i + 1) as f64;
+            let point = p + &(n * dist);
+
+            ao += f64::max(0.0, (dist - self.distance_field(&point)) / dist);
+        }
+
+        (1.0 - ao * self.ao_intensity).clamp(0., 1.)
     }
 }
 

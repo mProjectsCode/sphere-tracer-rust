@@ -1,4 +1,4 @@
-use crate::vector::Vec3;
+use crate::vec3::Vec3;
 
 #[derive(Debug, Clone, Copy)]
 pub struct Ray {
@@ -7,9 +7,9 @@ pub struct Ray {
 }
 
 impl Ray {
-    pub fn new(orig: Vec3, dir: Vec3) -> Self {
+    pub fn new(orig: &Vec3, dir: &Vec3) -> Self {
         Ray {
-            orig,
+            orig: orig.clone(),
             dir: dir.normalize(),
         }
     }
