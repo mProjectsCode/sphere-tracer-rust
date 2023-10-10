@@ -1,11 +1,13 @@
-use std::io::Write;
-use std::time::Instant;
 use std::{mem, thread};
+use std::io::Write;
 use std::ops::Deref;
-use std::sync::{Arc};
+use std::sync::Arc;
 use std::thread::JoinHandle;
+use std::time::Instant;
 
 use image::{Rgb, RgbImage};
+use itertools::{iproduct, Itertools};
+use rayon::prelude::*;
 
 use distance_fields::DistanceField;
 use distance_fields::DistanceFunction;
@@ -27,7 +29,7 @@ mod ray_marching;
 mod distance_fields;
 
 const ASPECT_RATIO: f64 = 16. / 9.;
-const IMAGE_WIDTH: u32 = 1080 * 2;
+const IMAGE_WIDTH: u32 = 1920;
 const IMAGE_HEIGHT: u32 = (IMAGE_WIDTH as f32 / ASPECT_RATIO as f32) as u32;
 
 fn main() {
@@ -79,91 +81,63 @@ fn create_image(ray_marcher: RayMarcher) -> RgbImage {
     let looking_at = Vec3::new(0.3, -1.6, -2.5);
     let view_direction = (looking_at - origin).normalize();
 
+    // horizontal and vertical vector of the view port
     let horizontal = Vec3::cross(&view_direction, &Vec3::new(0., 1., 0.)).normalize() * viewport_width;
     let vertical = -Vec3::cross(&view_direction, &horizontal).normalize() * viewport_height;
 
-    let lower_left_view_corner = -horizontal / 2.0 - vertical / 2.0;
-    let lower_left_corner = origin + lower_left_view_corner + view_direction * focal_length;
+    // lower left corner of the view port
+    let ll_view_corner = -horizontal / 2.0 - vertical / 2.0;
+    // ray direction of the lower left viewport corner
+    let ll_corner = ll_view_corner + view_direction * focal_length;
 
-    dbg!(lower_left_corner);
-    dbg!(lower_left_corner + horizontal * 1. + vertical * 1.);
+    // dbg!(ll_corner);
+    // dbg!(ll_corner + horizontal * 1. + vertical * 1.);
 
     let mut image = RgbImage::new(IMAGE_WIDTH, IMAGE_HEIGHT);
 
     let timer_start = Instant::now();
 
-    let mut rows: [Option<JoinHandle<[[u8; 3]; IMAGE_WIDTH as usize]>>; IMAGE_HEIGHT as usize] =  unsafe {
-        mem::MaybeUninit::uninit().assume_init()
-    };
-
     let arc_ray_marcher = Arc::new(ray_marcher);
-    let arc_origin = Arc::new(origin);
-    let arc_horizontal = Arc::new(horizontal);
 
-    for j in 0..IMAGE_HEIGHT {
-        let v = (j as f64) / ((IMAGE_HEIGHT - 1) as f64);
-        let pixel_pos_row = lower_left_corner + vertical * v;
+    // iterate over the pixel rows
+    let pixel_data: Vec<Vec<[u8; 3]>> = (0..IMAGE_HEIGHT).into_par_iter().map(|j| -> Vec<[u8; 3]> {
+        // clone a bunch of stuff into this scope
+        let clone_ray_marcher = arc_ray_marcher.clone();
+        let clone_origin = origin.clone();
+        let clone_ll_corner = ll_corner.clone();
+        let clone_horizontal = horizontal.clone();
+        let clone_vertical = vertical.clone();
 
-
-        rows[j as usize] = Some(calc_row(arc_ray_marcher.clone(), arc_origin.clone(), arc_horizontal.clone(), pixel_pos_row));
-    }
-
-    for j in 0..IMAGE_HEIGHT {
-        let row: Option<[[u8; 3]; IMAGE_WIDTH as usize]> = rows.get_mut(j as usize)
-            .map(|x| -> [[u8; 3]; IMAGE_WIDTH as usize] {
-                let handle = x.take().unwrap();
-                let result = handle.join();
-                result.unwrap()
-            });
-
-        for i in 0..IMAGE_WIDTH {
-            row.map(|x| -> () {
-                image.put_pixel(i, IMAGE_HEIGHT - j - 1, Rgb(x[i as usize]));
-            });
-        }
-    }
-
-
-
-
-    // for j in 0..IMAGE_HEIGHT {
-    //     for i in 0..IMAGE_WIDTH {
-    //         let u = (i as f64) / ((IMAGE_WIDTH - 1) as f64);
-    //         let v = (j as f64) / ((IMAGE_HEIGHT - 1) as f64);
-    //
-    //         let pixel_pos = lower_left_corner + horizontal * u + vertical * v;
-    //
-    //         let r = Ray::new(origin, pixel_pos - origin);
-    //         let pixel_color = ray_marcher.ray_marching(r);
-    //
-    //         image.put_pixel(i, IMAGE_HEIGHT - j - 1, Rgb(pixel_color.to_pixel_data()));
-    //     }
-    // }
+        // iterate over the pixels in the row and calculate their color
+        (0..IMAGE_WIDTH).map(|i| -> [u8; 3] {
+            calc_pixel(clone_ray_marcher.deref(), i, j, &clone_origin, &clone_ll_corner, &clone_horizontal, &clone_vertical)
+        }).collect()
+    }).collect();
 
     let timer_duration = timer_start.elapsed();
+
+    // set the pixel in the actual image
+    for j in 0..IMAGE_HEIGHT {
+        for i in 0..IMAGE_WIDTH {
+            let pixel_color = Rgb(pixel_data[j as usize][i as usize]);
+
+            image.put_pixel(i, IMAGE_HEIGHT - j - 1, pixel_color);
+        }
+    }
 
     println!("Rendered image ({IMAGE_WIDTH}x{IMAGE_HEIGHT}) in {:?}", timer_duration);
 
     image
 }
 
-fn calc_row(rm: Arc<RayMarcher>, origin: Arc<Vec3>, pixel_pos_horizontal: Arc<Vec3>, pixel_pos_row: Vec3) -> JoinHandle<[[u8; 3]; IMAGE_WIDTH as usize]> {
-    thread::spawn(move || {
-        let mut row: [[u8; 3]; IMAGE_WIDTH as usize] = unsafe {
-            mem::MaybeUninit::uninit().assume_init()
-        };
+fn calc_pixel(rm: &RayMarcher, i: u32, j: u32, origin: &Vec3, ll_corner: &Vec3, horizontal: &Vec3, vertical: &Vec3) -> [u8; 3] {
+    let u = (i as f64) / ((IMAGE_WIDTH - 1) as f64);
+    let v = (j as f64) / ((IMAGE_HEIGHT - 1) as f64);
 
-        for i in 0..IMAGE_WIDTH {
-            let u = (i as f64) / ((IMAGE_WIDTH - 1) as f64);
+    let pixel_pos = ll_corner + horizontal * u + vertical * v;
 
-            let pixel_pos = pixel_pos_row + pixel_pos_horizontal.deref() * u;
+    let r = Ray::new(&origin, &pixel_pos);
+    let pixel_color = rm.ray_marching(r);
 
-            let r = Ray::new(origin.deref(), &(pixel_pos - origin.deref()));
-            let pixel_color = rm.ray_marching(r);
-
-            row[i as usize] = pixel_color.to_pixel_data();
-        }
-
-        row
-    })
+    pixel_color.to_pixel_data()
 }
